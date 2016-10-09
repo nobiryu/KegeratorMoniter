@@ -1,0 +1,242 @@
+using LagoVista.Common.Commanding;
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.ComponentModel;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Text;
+using System.Threading.Tasks;
+using Windows.Devices.Enumeration;
+using Windows.Devices.I2c;
+
+namespace LagoVista.IoT.Common.Kegerator
+{
+    public class Kegerator : INotifyPropertyChanged
+    {
+        public event PropertyChangedEventHandler PropertyChanged;
+
+        private Models.Keg _keg1;
+        private Models.Keg _keg2;
+        private Models.Keg _keg3;
+        private Models.Keg _keg4;
+        private CO2.CO2Tank _co2Tank; 
+
+        private Kegerator() { }
+
+        public List<DeviceBase> _devices = new List<DeviceBase>();
+
+        private void RaisePropertyChanged([CallerMemberName] string propertyName = null)
+        {
+            var eventHandler = this.PropertyChanged;
+            if (eventHandler != null)
+            {
+                eventHandler(this, new PropertyChangedEventArgs(propertyName));
+            }
+        }
+
+        private bool Set<T>(ref T storage, T value, string columnName = null, [CallerMemberName] string propertyName = null)
+        {
+            if (object.Equals(storage, value)) return false;
+
+            storage = value;
+            this.RaisePropertyChanged(propertyName);
+            return true;
+        }
+
+        byte[] _scalesAddresses = { 0x43, 0x41, 0x40, 0x42 };
+
+        private const string I2C_CONTROLLER_NAME = "I2C1";
+
+        private Thermo.Temperatures _temperatures;
+        private Thermo.Controller _tempController;
+
+        private Scales.Scale _co2Scale;
+        private Dictionary<int, Scales.Scale> _kegScales;
+
+        private CO2.PressureSensor _pressureSensor;
+        private LED.LEDManager _ledManager;
+
+        private REST.KegeratorServices _kegServices;
+
+        private static Kegerator _kegerator = new Kegerator();
+        public static Kegerator Instance { get { return _kegerator; } }
+
+        private CloudServices.EventHubClient _eventHubClient;
+
+        System.Threading.Timer _timer;
+
+
+        private bool _initialized = false;
+
+        public async Task Init()
+        {
+            if (!_initialized)
+            {
+                _initialized = true;
+                var selector = I2cDevice.GetDeviceSelector(I2C_CONTROLLER_NAME);  /* Find the selector string for the I2C bus controller                   */
+                var deviceInfo = (await DeviceInformation.FindAllAsync(selector)).FirstOrDefault();            /* Find the I2C bus controller device with our selector string           */
+
+                var deviceId = deviceInfo == null ? (string)null : deviceInfo.Id;
+                _temperatures = new Thermo.Temperatures(0x48);
+                await _temperatures.Init(deviceId);
+                _devices.Add(_temperatures);
+
+                _tempController = new Thermo.Controller();
+                _tempController.Init(_temperatures);
+                _devices.Add(_tempController);
+
+                _pressureSensor = new CO2.PressureSensor();
+                await _pressureSensor.Init(deviceId, TimeSpan.FromSeconds(1));
+                _devices.Add(_pressureSensor);
+
+                _co2Scale = new Scales.Scale(0x44);
+                await _co2Scale.Init(deviceId, TimeSpan.FromSeconds(1));
+                _devices.Add(_co2Scale);
+
+                _co2Tank = new CO2.CO2Tank(_co2Scale, TimeSpan.FromSeconds(2));
+                _co2Tank.Load();
+                _devices.Add(_co2Tank);
+
+                _kegScales = new Dictionary<int, Scales.Scale>();
+
+                _eventHubClient = new CloudServices.EventHubClient(this, TimeSpan.FromSeconds(2));
+                _devices.Add(_eventHubClient);
+
+                for (var idx = 0; idx < 4; ++idx)
+                {
+                    var scale = new Scales.Scale(_scalesAddresses[idx]);
+                    await scale.Init(deviceId, TimeSpan.FromMilliseconds(500));
+                    _kegScales.Add(idx, scale);
+                    _devices.Add(scale);
+                }
+
+                _keg1 = new Models.Keg(1, _kegScales[0], TimeSpan.FromMilliseconds(500));
+                _keg1.Load();
+                _devices.Add(_keg1);
+                _keg2 = new Models.Keg(2, _kegScales[1], TimeSpan.FromMilliseconds(500));
+                _keg2.Load();
+                _devices.Add(_keg2);
+                _keg3 = new Models.Keg(3, _kegScales[2], TimeSpan.FromMilliseconds(500));
+                _keg3.Load();
+                _devices.Add(_keg3);
+                _keg4 = new Models.Keg(4, _kegScales[3], TimeSpan.FromMilliseconds(500));
+                _keg4.Load();
+                _devices.Add(_keg4);
+
+
+
+                DateInitialized = DateTime.Now.ToString();
+
+                Web.WebServer.Instance.StartServer();
+
+                _kegServices = new REST.KegeratorServices() { Port = 9500 };
+                _kegServices.EventContent += _kegServices_EventContent;
+                _kegServices.StartServer();
+
+                _timer = new System.Threading.Timer((state) =>
+                {
+                    Refresh();
+                }, null, 0, 250);
+            }
+
+        }
+
+        private void _kegServices_EventContent(object sender, string e)
+        {
+            var parts = e.Split('/');
+            if (parts.Count() > 0)
+            {
+                switch (parts[1])
+                {
+                    case "zero":
+                        {
+                            var scaleIndex = Convert.ToInt32(parts[2]);
+                            _kegScales[scaleIndex].StoreOffset();
+                        }
+                        break;
+                    case "cal":
+                        {
+                            var scaleIndex = Convert.ToInt32(parts[2]);
+                            _kegScales[scaleIndex].CalibrationWeight = Convert.ToDouble(parts[3]);
+                            _kegScales[scaleIndex].Calibrate();
+                        }
+                        break;
+                }
+            }
+        }
+
+        public void Refresh()
+        {
+            foreach (var device in _devices)
+            {
+                if (DateTime.Now > (device.LastUpdated + device.UpdateInterval))
+                    device.Refresh();
+            }
+
+            LagoVista.Common.PlatformSupport.Services.DispatcherServices.Invoke(() =>
+            {
+                CurrentTimeDisplay = DateTime.Now.ToString();
+                RaisePropertyChanged("CurrentTimeDisplay");
+            });
+        }
+
+        public Thermo.Temperatures Temperatures { get { return _temperatures; } }
+
+
+        public Thermo.Controller TemperatureController { get { return _tempController; } }
+
+
+        private String _statusMessage;
+        public String StatusMessage
+        {
+            get { return _statusMessage; }
+            set { Set(ref _statusMessage, value); }
+        }
+
+        public List<Scales.Scale> KegScales
+        {
+            get { return _kegScales.Values.ToList(); }
+        }
+
+        public void ToggleCompressor()
+        {
+            if (_tempController.IsCompressorOn)
+                _tempController.CompressorOff();
+            else
+                _tempController.CompressorOn();
+        }
+
+        public String DateInitialized
+        {
+            get;
+            set;
+        }
+
+        public String CurrentTimeDisplay
+        {
+            get;
+            set;
+        }
+
+        public Scales.Scale CO2Scale
+        {
+            get { return _co2Scale; }
+        }
+
+        public CO2.PressureSensor PressureSensor
+        {
+            get { return _pressureSensor; }
+        }
+
+
+        public Models.Keg Keg1 { get { return _keg1; } }
+        public Models.Keg Keg2 { get { return _keg2; } }
+        public Models.Keg Keg3 { get { return _keg3; } }
+        public Models.Keg Keg4 { get { return _keg4; } }
+
+        public CO2.CO2Tank CO2Tank { get { return _co2Tank; } }
+
+        public RelayCommand ToggleCompressorCommand { get { return new RelayCommand(ToggleCompressor); } }
+    }
+}
