@@ -1,0 +1,209 @@
+using LagoVista.Common.Commanding;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Windows.UI.Xaml;
+
+namespace LagoVista.IoT.Common.Kegerator.Models
+{
+    public class Keg : DeviceBase
+    {
+        int _idx;
+        TimeSpan _updateInterval;
+        private Scales.Scale _scale;
+        public Keg(int idx, Scales.Scale scale, TimeSpan updateInterval)
+        {
+            _idx = idx;
+            _updateInterval = UpdateInterval;
+            _scale = scale;
+        }
+
+        public override TimeSpan UpdateInterval
+        {
+            get { return _updateInterval; }
+            
+        }
+
+        public override void Refresh()
+        {
+            LastUpdated = DateTime.Now;
+
+            LagoVista.Common.PlatformSupport.Services.DispatcherServices.Invoke(() =>
+            {
+                ContentsWeight = Scale.Weight - ContainerWeightLb;
+                if (FullContentsWeightLb > 0)
+                    PercentFull = Convert.ToInt32((ContentsWeight / (FullContentsWeightLb - ContainerWeightLb)) * 100);
+                else
+                    PercentFull = 0;
+
+                PercentFull = Math.Min(PercentFull, 100);
+
+                if (GlassSizeOz > 0)
+                    QtyRemaining = Convert.ToInt32((ContentsWeight * 16)/ GlassSizeOz);
+                else
+                    QtyRemaining = 0;
+
+                RaisePropertyChanged("PercentFullHeight");
+                RaisePropertyChanged("PercentFullDisplay");
+            });
+
+        }
+
+        public Scales.Scale Scale
+        {
+            get { return _scale; }
+        }
+
+
+        #region Calculated Properties
+        private int _qtyRemaining;
+        public int QtyRemaining
+        {
+            get { return _qtyRemaining; }
+            set { Set(ref _qtyRemaining, value); }
+        }
+        
+
+        private DateTime? _installDate;
+        public DateTime? InstallDate
+        {
+            get { return _installDate; }
+            set { Set(ref _installDate, value); }
+        }
+
+
+        private int _percentFull;
+        public int PercentFull
+        {
+            get { return _percentFull; }
+            set { Set(ref _percentFull, value); }
+        }
+
+        public String PercentFullDisplay
+        {
+            get { return String.Format("{0}%", Convert.ToInt32(PercentFull)); }
+        }
+
+        public double PercentFullHeight
+        {
+            get { return Convert.ToDouble(_percentFull * 2); }
+        }
+
+        public int KegIndex
+        {
+            get { return _idx; }
+        }
+        #endregion
+
+        #region Entered Properties
+        private bool _isEmpty;
+        public bool IsEmpty
+        {
+            get { return _isEmpty; }
+            set {
+                _isEmpty = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        private double _glassSize;
+        public double GlassSizeOz
+        {
+            get { return _glassSize; }
+            set { Set(ref _glassSize, value); }
+        }
+
+        private DateTime? _bornDate;
+        public DateTime? BornDate
+        {
+            get { return _bornDate; }
+            set { Set(ref _bornDate, value); }
+        }
+
+
+        double _containerWeight;
+        public double ContainerWeightLb
+        {
+            get { return _containerWeight; }
+            set { Set(ref _containerWeight, value); }
+        }
+
+        double _contentsWeight;
+        public double ContentsWeight
+        {
+            get { return _contentsWeight; }
+            set { Set(ref _contentsWeight, value); }
+        }
+
+        double _fullContentsWeight;
+        public double FullContentsWeightLb
+        {
+            get { return _fullContentsWeight; }
+            set { Set(ref _fullContentsWeight, value); }
+        }
+
+
+        private String _contentsName;
+        public String ContentsName
+        {
+            get { return _contentsName; }
+            set { Set(ref _contentsName, value); }
+        }
+        #endregion
+
+        public void Save()
+        {
+            LagoVista.Common.PlatformSupport.Services.BindingHelper.RefreshBindings();
+            PutSetting(String.Format("KEG{0}_CONTENTS", _idx), ContentsName);
+            PutSetting(String.Format("KEG{0}_IS_EMPTY", _idx), IsEmpty.ToString());
+            PutSetting(String.Format("KEG{0}_CONTAINER_WEIGHT", _idx), String.Format("{0:0.00}", ContainerWeightLb));
+            PutSetting(String.Format("KEG{0}_GLASS_SIZE", _idx), String.Format("{0:0.00}", GlassSizeOz));
+            PutSetting(String.Format("KEG{0}_FULL_CONTENTS_WEIGHT", _idx), String.Format("{0:0.00}", FullContentsWeightLb));
+
+
+            if (BornDate.HasValue)
+                PutSetting(String.Format("KEG{0}_BORN_DATE", _idx), BornDate.Value.ToString());
+            else
+                RemoveSetting(String.Format("KEG{0}_BORN_DATE", _idx));
+
+            if(InstallDate.HasValue)
+                PutSetting(String.Format("KEG{0}_INSTALL_DATE", _idx), InstallDate.Value.ToString());
+            else
+                RemoveSetting(String.Format("KEG{0}_INSTALL_DATE", _idx));
+        }
+
+        public void Load()
+        {
+            ContentsName = GetSetting(String.Format("KEG{0}_CONTENTS", _idx), "?");
+            ContainerWeightLb = Convert.ToDouble(GetSetting(String.Format("KEG{0}_CONTAINER_WEIGHT", _idx), "10.0"));
+            GlassSizeOz = Convert.ToDouble(GetSetting(String.Format("KEG{0}_GLASS_SIZE", _idx), "12.0"));
+            FullContentsWeightLb = Convert.ToDouble(GetSetting(String.Format("KEG{0}_FULL_CONTENTS_WEIGHT", _idx), "0.0"));
+            IsEmpty = Convert.ToBoolean(GetSetting(String.Format("KEG{0}_IS_EMPTY", _idx), "True"));
+
+            var bornDate = GetSetting("KEG{0}_BORN_DATE", String.Empty);
+            if (!String.IsNullOrEmpty(bornDate))
+                BornDate = DateTime.Parse(bornDate);
+            else
+                BornDate = null;
+
+            var installDate = GetSetting("KEG{0}_INSTALL_DATE", String.Empty);
+            if (!String.IsNullOrEmpty(installDate))
+                InstallDate = DateTime.Parse(installDate);
+            else
+                InstallDate = null;
+        }
+
+        public async void SaveFullWeight()
+        {
+            FullContentsWeightLb = await Scale.GetAverageWeight();
+            Save();
+        }
+
+        public RelayCommand SaveFullWeightCommand
+        {
+            get { return new RelayCommand(() => SaveFullWeight()); }
+        }
+    }
+}
