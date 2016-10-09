@@ -1,0 +1,339 @@
+using LagoVista.Common.Commanding;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Windows.Devices.I2c;
+
+namespace LagoVista.IoT.Common.Kegerator.Scales
+{
+    public class Scale : DeviceBase
+    {
+        Windows.Devices.I2c.I2cDevice _scaleI2CChannel;
+
+        int _countOffset;
+        double? _calibrationFactor = null;
+
+        private TimeSpan _updateInterval;
+        byte _address;
+        public Scale(byte address)
+        {
+            _address = address;
+        }
+
+
+        private void WriteValue(byte address, int value)
+        {
+            if (!IsDemoMode)
+            {
+                var offsetBuffer = new byte[5];
+                offsetBuffer[0] = address;
+                offsetBuffer[1] = (byte)(value >> 24);
+                offsetBuffer[2] = (byte)(value >> 16);
+                offsetBuffer[3] = (byte)(value >> 8);
+                offsetBuffer[4] = (byte)(value);
+
+                _scaleI2CChannel.Write(offsetBuffer);
+            }
+        }
+
+        public async Task Init(String i2cDeviceId, TimeSpan updateInterval)
+        {
+            var settings = new I2cConnectionSettings(_address)
+            {
+                BusSpeed = I2cBusSpeed.StandardMode,
+                SharingMode = I2cSharingMode.Shared
+            };
+
+            _updateInterval = updateInterval;
+
+            IsDemoMode = String.IsNullOrEmpty(i2cDeviceId);
+
+            if (!IsDemoMode)
+            {
+                _scaleI2CChannel = await Windows.Devices.I2c.I2cDevice.FromIdAsync(i2cDeviceId, settings);
+
+                if (Windows.Storage.ApplicationData.Current.LocalSettings.Values.ContainsKey(String.Format("{0:X}.OFFSET", _address)))
+                {
+                    _countOffset = Convert.ToInt32(Windows.Storage.ApplicationData.Current.LocalSettings.Values[String.Format("{0:X}.OFFSET", _address)]);
+                    try
+                    {
+                        WriteValue((byte)'O', _countOffset);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine("Scale offline ");
+                    }
+                }
+
+                if (Windows.Storage.ApplicationData.Current.LocalSettings.Values.ContainsKey(String.Format("{0:X}.CALIBRATION", _address)))
+                {
+                    _calibrationFactor = Convert.ToDouble(Windows.Storage.ApplicationData.Current.LocalSettings.Values[String.Format("{0:X}.CALIBRATION", _address)]);
+                    LagoVista.Common.PlatformSupport.Services.DispatcherServices.Invoke(() =>
+                    {
+                        Status = "Ready";
+                    });
+                }
+            }
+            else
+            {
+                LagoVista.Common.PlatformSupport.Services.DispatcherServices.Invoke(() =>
+                {
+                    Status = "Ready";
+                });
+            }
+        }
+
+        int? _lastRaw = null;
+
+        private int GetRaw()
+        {
+            try
+            {
+                var inbuffer = new byte[4];
+                _scaleI2CChannel.Write(new byte[] { (byte)0x11 });
+                _scaleI2CChannel.Read(inbuffer);
+
+                /* Note on the scale, this is a long (64 bit) here it's a int (64 bit) */
+                var thisRaw = (int)(inbuffer[0] << 24 | inbuffer[1] << 16 | inbuffer[2] << 8 | inbuffer[3]);
+                if (_lastRaw.HasValue)
+                {
+                    if (Math.Abs(_lastRaw.Value - thisRaw) > 0xFFFF)
+                        return _lastRaw.Value;
+                }
+                else
+                    _lastRaw = thisRaw;
+
+                return thisRaw;
+
+            }
+            catch (Exception)
+            {
+                return -1;
+            }
+        }
+
+        public override void Refresh()
+        {
+            LastUpdated = DateTime.Now;
+
+            int rawResult = 0;
+
+            var isOnline = true;
+            try
+            {
+                var inbuffer = new byte[4];
+                var statusBuffer = new byte[1];
+
+                if (!IsDemoMode)
+                {
+                    _scaleI2CChannel.Write(new byte[] { (byte)0x0A });
+                    _scaleI2CChannel.Read(statusBuffer);
+
+                    rawResult = GetRaw();
+                }
+
+                if (_calibrationFactor.HasValue)
+                {
+                    Weight = (rawResult - _countOffset) * _calibrationFactor.Value;
+                    Debug.WriteLine(String.Format("0x{0:X} WEIGHT VALUE => {1:0.00} lbs", _address, Weight));
+                }
+                else if (_countOffset > 0)
+                    Debug.WriteLine(String.Format("0x{0:X} ZEROED VALUE => {1}", _address, rawResult - _countOffset));
+                else
+                    Debug.WriteLine(String.Format("0x{0:X} RAW VALUE =>  0x{1:X}", _address, rawResult));
+            }
+            catch (Exception ex)
+            {
+                rawResult = -1;
+                isOnline = false;
+                Debug.WriteLine(ex.Message);
+            }
+
+            LagoVista.Common.PlatformSupport.Services.DispatcherServices.Invoke(() =>
+            {
+
+                Raw = rawResult;
+                IsOnline = isOnline;
+                if (!IsOnline)
+                {
+                    Status = "Offline";
+                    WeightDisplay = "?";
+                }
+                else
+                {                    
+                    if (_calibrationFactor.HasValue)
+                    {
+                        Status = "Ready";
+                        WeightDisplay = String.Format("{0}lb {1:00}oz", Math.Truncate(Weight), ((Weight % 1.0) * 16.0));
+                    }
+                    else
+                    {
+                        WeightDisplay = "?";
+                        Status = "Not Calibrated";
+                    }
+                }
+
+                RaisePropertyChanged("LastUpdateDisplay");
+            });
+        }
+
+        const int CALIBRATION_COUNT = 10;
+
+        public async void StoreOffset()
+        {
+            LagoVista.Common.PlatformSupport.Services.DispatcherServices.Invoke(() =>
+            {
+                Status = "Zeroing";
+            });
+
+            Debug.WriteLine("Staritng Zero Process");
+            long zeroSum = 0;
+
+            for (var idx = 0; idx < CALIBRATION_COUNT; ++idx)
+            {
+                await Task.Delay(250);
+                zeroSum += GetRaw();
+            }
+
+            _countOffset = (int)(zeroSum / CALIBRATION_COUNT);
+
+            WriteValue((byte)'O', _countOffset);
+
+            Debug.WriteLine(String.Format("Finished Zero Process {0:X}", _countOffset));
+
+            if (Windows.Storage.ApplicationData.Current.LocalSettings.Values.ContainsKey(String.Format("{0:X}.OFFSET", _address)))
+                Windows.Storage.ApplicationData.Current.LocalSettings.Values.Remove(String.Format("{0:X}.OFFSET", _address));
+
+            Windows.Storage.ApplicationData.Current.LocalSettings.Values.Add(String.Format("{0:X}.OFFSET", _address), _countOffset);
+            Debug.WriteLine("Finished Zero Process");
+
+            LagoVista.Common.PlatformSupport.Services.DispatcherServices.Invoke(() =>
+            {
+                Status = "Zeroed";
+            });
+        }
+
+        public async void Calibrate()
+        {
+            Status = "Calibrating";
+
+            LagoVista.Common.PlatformSupport.Services.BindingHelper.RefreshBindings();
+
+            long countSum = 0;
+            for (var idx = 0; idx < CALIBRATION_COUNT; ++idx)
+            {
+                await Task.Delay(250);
+                countSum += GetRaw() - _countOffset;
+            }
+
+            _calibrationFactor = CalibrationWeight / (countSum / CALIBRATION_COUNT);
+
+            if (Windows.Storage.ApplicationData.Current.LocalSettings.Values.ContainsKey(String.Format("{0:X}.CALIBRATION", _address)))
+                Windows.Storage.ApplicationData.Current.LocalSettings.Values.Remove(String.Format("{0:X}.CALIBRATION", _address));
+
+            Windows.Storage.ApplicationData.Current.LocalSettings.Values[String.Format("{0:X}.CALIBRATION", _address)] = _calibrationFactor;
+        }
+
+        public async Task<double> GetAverageWeight(int pointCount = 5)
+        {
+            var weightSum = 0.0;
+
+            for(var idx = 0; idx < pointCount; ++idx)
+            {
+                weightSum += Weight;
+                await Task.Delay(UpdateInterval);
+            }
+
+            return weightSum / pointCount;
+        }
+
+        private int _fullRaw;
+        public int FullRaw
+        {
+            get { return _fullRaw; }
+            set { Set(ref _fullRaw, value); }
+        }
+
+        private double _weight;
+        public double Weight
+        {
+            get { return _weight; }
+            set { _weight = value; }
+        }
+
+        private String _weightDisplay;
+        public String WeightDisplay
+        {
+            get { return _weightDisplay; }
+            set { Set(ref _weightDisplay, value); }
+        }
+
+
+        private int _raw;
+        public int Raw
+        {
+            get { return _raw; }
+            set
+            {
+                RaisePropertyChanged("RawDisplay");
+                Set(ref _raw, value);
+            }
+        }
+
+        public String AddressDisplay
+        {
+            get { return String.Format("0x{0:X}", _address); }
+        }
+
+        public String RawDisplay
+        {
+            get { return String.Format("{0:X}", Raw); }
+        }
+
+        private int _tareRaw;
+        public int TareRaw
+        {
+            get { return _tareRaw; }
+            set { Set(ref _tareRaw, value); }
+        }
+
+        private int _beerCount;
+        public int BeerCount
+        {
+            get { return _beerCount; }
+            set { Set(ref _beerCount, value); }
+        }
+
+        private double _percentFull;
+        public double PercentFull
+        {
+            get { return _percentFull; }
+            set { Set(ref _percentFull, value); }
+        }
+
+        public override TimeSpan UpdateInterval
+        {
+            get { return _updateInterval; }
+        }
+
+        private double _calibrationWeight;
+        public double CalibrationWeight
+        {
+            get { return _calibrationWeight; }
+            set { _calibrationWeight = value; }
+        }
+
+        public RelayCommand ZeroCommand
+        {
+            get { return new RelayCommand(() => StoreOffset()); }
+        }
+
+        public RelayCommand CalibrationCommand
+        {
+            get { return new RelayCommand(() => Calibrate()); }
+        }
+    }
+}
